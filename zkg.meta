@@ -1,0 +1,4 @@
+[package]
+description=A Zeekctl plugin that hooks install and start to run Zeek using systemd
+plugin_dir = plugin
+tags = zeekctl, systemd, supervisor
