@@ -128,6 +128,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         self.zeek_bin = pathlib.Path(self.getGlobalOption("bindir")) / "zeek"
         self.bin_dir = pathlib.Path(self.getGlobalOption("bindir"))
         self.scripts_dir = pathlib.Path(self.getGlobalOption("scriptsdir"))
+        self.zeek_base_dir = pathlib.Path(self.getGlobalOption("zeekbase"))
         self.env_file_common = self.spool_dir / "environment"
 
         self.env_file_d = (
@@ -275,6 +276,11 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             ]
         )
 
+        zeek_args = ["-U", ".status"]
+        zeek_args += self.getGlobalOption("sitepolicyscripts").split()
+        zeek_args += ["zeekctl/auto"]
+        zeek_args += [self.getGlobalOption("zeekargs")]
+
         format_kwargs = {
             "user": self.getOption("user"),
             "group": self.getOption("group"),
@@ -283,9 +289,12 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             "env_file_d": self.env_file_d,
             "path": self.path,
             "zeek_bin": self.zeek_bin,
+            "zeek_args": " ".join(zeek_args),
             "restart": self.getOption("restart"),
             "restart_sec": self.getOption("restart_sec"),
             "start_limit_interval_sec": self.getOption("start_limit_interval_sec"),
+            "scripts_dir": self.scripts_dir,
+            "zeek_base_dir": self.zeek_base_dir,
         }
 
         with self.zeek_target.open("w") as f:
@@ -313,14 +322,9 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             f.write("# This file is auto-generated - do not modify\n")
             f.write(f"ZEEKPATH={zeekpath}\n")
 
-        zeek_args = ["-U", ".status"]
-        zeek_args += self.getGlobalOption("sitepolicyscripts").split()
-        zeek_args += ["zeekctl/auto"]
-        zeek_args += [self.getGlobalOption("zeekargs")]
-
         with self.manager_unit.open("w") as f:
             content = Units.manager_unit.format(
-                zeek_args=" ".join(zeek_args),
+                type="manager",
                 memory_max=self.getOption("manager_memory_max"),
                 **format_kwargs,
             )
@@ -328,7 +332,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
 
         with self.logger_unit.open("w") as f:
             content = Units.logger_unit_instance.format(
-                zeek_args=" ".join(zeek_args),
+                type="logger",
                 memory_max=self.getOption("logger_memory_max"),
                 **format_kwargs,
             )
@@ -336,7 +340,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
 
         with self.proxy_unit.open("w") as f:
             content = Units.proxy_unit_instance.format(
-                zeek_args=" ".join(zeek_args),
+                type="proxy",
                 memory_max=self.getOption("proxy_memory_max"),
                 **format_kwargs,
             )
@@ -344,7 +348,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
 
         with self.worker_unit.open("w") as f:
             content = Units.worker_unit_instance.format(
-                zeek_args=" ".join(zeek_args),
+                type="worker",
                 interface=interface,
                 memory_max=self.getOption("worker_memory_max"),
                 **format_kwargs,
@@ -541,7 +545,9 @@ class Units:
         User={user}
         Group={group}
 
-        ReadWritePaths={spool_dir}/logger-%i
+        # The logger moves files from its spool directory into <base>/logs/<date>
+        # so cannot limit ReadWritePaths to its spool directory.
+        ReadWritePaths={zeek_base_dir}
         WorkingDirectory={spool_dir}/logger-%i
 
         MemoryMax={memory_max}
@@ -554,7 +560,9 @@ class Units:
         Environment=PATH={path}
         ExecStartPre=sh -c 'date +%%s > .startup'
         ExecStart={zeek_bin} {zeek_args}
-        ExecStopPost=
+
+        # We don't have a crashflag, though we might be able to use EXIT_STATUS from systemd.
+        ExecStopPost={scripts_dir}/post-terminate {type} {spool_dir}/logger-%i
 
         Slice=zeek-loggers.slice
 
