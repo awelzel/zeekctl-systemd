@@ -3,6 +3,9 @@ import pathlib
 import subprocess
 import typing
 import textwrap
+import pwd
+import grp
+import os
 
 import ZeekControl.cmdresult
 import ZeekControl.config as config
@@ -11,15 +14,14 @@ import ZeekControl.plugin
 
 class Systemd:
     """
-    API for interacting with systemd.
-
-    I'm sure this could be done with DBUS, but this does it for now.
+    Minmal class for interacting with systemd.
     """
 
     logger = logging.getLogger("zeekctl.systemd")
-    logger.addHandler(logging.StreamHandler())
+    # logger.addHandler(logging.StreamHandler())
 
-    def __init__(self):
+    def __init__(self, plugin):
+        self.plugin = plugin
         self.bin = "systemctl"
 
         self.options = ["--no-page", "--no-ask-password"]
@@ -37,7 +39,11 @@ class Systemd:
     def systemctl(self, args):
         real_args = [self.bin, *self.options, *args]
         self.logger.debug("%s", " ".join(real_args))
-        return subprocess.check_output(real_args)
+        try:
+            return subprocess.check_output(real_args)
+        except subprocess.CalledProcessError as e:
+            self.plugin.error(f"error starting: {e!r}")
+            return None
 
     def enable(self, name, *, now=False):
         args = ["enable"]
@@ -48,7 +54,7 @@ class Systemd:
         return self.systemctl(args)
 
     def start(self, units: typing.List[str]):
-        return self.systemctl(["start", *units])
+        self.systemctl(["start", *units])
 
     def stop(self, units: typing.List[str]):
         return self.systemctl(["stop", *units])
@@ -65,7 +71,7 @@ class Systemd:
 
     def show(self, args, *, all=True):
         """
-        Helper to run systemctl show and capture some interesting information.
+        Helper to run `systemctl show <args>` and capture some interesting information per unit.
         """
         real_args = ["show"]
         if all:
@@ -73,8 +79,7 @@ class Systemd:
 
         real_args += args
 
-        output = self.systemctl(real_args)
-        output = output.decode("utf-8")
+        output = self.systemctl(real_args).decode("utf-8")
         result = []
         current = {}
         for line in output.splitlines():
@@ -98,6 +103,7 @@ class Systemd:
 class SystemdPlugin(ZeekControl.plugin.Plugin):
     def __init__(self):
         super().__init__(apiversion=1)
+        self.sd = Systemd(self)
 
     def name(self):
         return "zeekctl-systemd"
@@ -112,6 +118,9 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         self.enabled = self.getOption("enabled")
         if not self.enabled:
             return False
+
+        if os.getuid() != 0:
+            self.message(f"{self.prefix()}: not running as root will not work")
 
         self.spooldir = pathlib.Path(self.getGlobalOption("spooldir")) / self.prefix()
         self.spooldir.mkdir(parents=True, exist_ok=True)
@@ -141,7 +150,16 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         self.proxies_slice = self.lib_unit_path / "zeek-proxies.slice"
         self.workers_slice = self.lib_unit_path / "zeek-workers.slice"
 
-        self.sd = Systemd()
+        self.user = self.getOption("user")
+        self.group = self.getOption("group")
+        try:
+            pwd.getpwnam(self.user)
+        except KeyError:
+            self.error(f"{self.prefix()}: configured user {self.user} not available")
+        try:
+            grp.getgrnam(self.group)
+        except KeyError:
+            self.error(f"{self.prefix()}: configured group {self.group} not available")
 
         if len(self.hosts()) > 1:
             self.message("Warning: No support for multiple hosts at this point.")
@@ -162,6 +180,8 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
     def options(self):
         return [
             ("enabled", "bool", False, "Set to enable plugin"),
+            ("user", "string", "zeek", "The user to run Zeek under"),
+            ("group", "string", "zeek", "The group to run Zeek under"),
             (
                 "default_path",
                 "string",
@@ -249,6 +269,16 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             ]
         )
 
+        format_kwargs = {
+            "user": self.getOption("user"),
+            "group": self.getOption("group"),
+            "spooldir": self.getGlobalOption("spooldir"),
+            "env_file_common": self.env_file_common,
+            "env_file_d": self.env_file_d,
+            "path": self.path,
+            "zeek_bin": self.zeek_bin,
+        }
+
         with self.zeek_target.open("w") as f:
             f.write(Units.zeek_target)
 
@@ -281,47 +311,34 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
 
         with self.manager_unit.open("w") as f:
             content = Units.manager_unit.format(
-                zeek_bin=self.zeek_bin,
                 zeek_args=" ".join(zeek_args),
-                path=self.path,
-                spooldir=self.getGlobalOption("spooldir"),
-                env_file_common=self.env_file_common,
-                env_file_d=self.env_file_d,
+                memory_max=self.getOption("manager_memory_max"),
+                **format_kwargs,
             )
             f.write(content)
 
         with self.logger_unit.open("w") as f:
             content = Units.logger_unit_instance.format(
-                zeek_bin=self.zeek_bin,
                 zeek_args=" ".join(zeek_args),
-                path=self.path,
-                spooldir=self.getGlobalOption("spooldir"),
-                env_file_common=self.env_file_common,
-                env_file_d=self.env_file_d,
+                memory_max=self.getOption("logger_memory_max"),
+                **format_kwargs,
             )
             f.write(content)
 
         with self.proxy_unit.open("w") as f:
             content = Units.proxy_unit_instance.format(
-                zeek_bin=self.zeek_bin,
                 zeek_args=" ".join(zeek_args),
-                path=self.path,
-                spooldir=self.getGlobalOption("spooldir"),
-                env_file_common=self.env_file_common,
-                env_file_d=self.env_file_d,
+                memory_max=self.getOption("proxy_memory_max"),
+                **format_kwargs,
             )
             f.write(content)
 
         with self.worker_unit.open("w") as f:
             content = Units.worker_unit_instance.format(
-                zeek_bin=self.zeek_bin,
                 zeek_args=" ".join(zeek_args),
-                path=self.path,
-                memory_max=self.getOption("worker_memory_max"),
-                spooldir=self.getGlobalOption("spooldir"),
                 interface=interface,
-                env_file_common=self.env_file_common,
-                env_file_d=self.env_file_d,
+                memory_max=self.getOption("worker_memory_max"),
+                **format_kwargs,
             )
             f.write(content)
 
@@ -365,11 +382,19 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             if expected_unit not in enabled_unit_ids:
                 self.sd.enable(expected_unit)
 
-        # Create working already now, too.
+        # Create working now as the right user.
         dirs = [(node, node.cwd()) for node in config.Config.nodes()]
         for node, success, output in self.executor.mkdirs(dirs):
             if not success:
-                self.ui.error(f"cannot create working directory for {node.name}")
+                self.error(f"cannot create working directory for {node.name}")
+
+        cmds = [
+            (node, "chown", ["-R", f"{self.user}:{self.group}", node.cwd()])
+            for node in config.Config.nodes()
+        ]
+        for node, success, output in self.executor.run_cmds(cmds):
+            if not success:
+                self.error(f"cannot chown working directory for {node.name}")
 
     def cmd_start_pre(self, nodes):
         """
@@ -432,9 +457,12 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             else:
                 r = result_by_id[unit_id]
                 state = r["ActiveState"]
-                # If someone stopped just that node with systemdctl
-                # it'll show up as crashed, oh well.
-                if state != "inactive":
+                # If someone stopped a node with systemctl stop zeek-worker@3,
+                # then it's state is inactive.
+                if state == "inactive":
+                    n.setExpectRunning(True)
+                    n.clearPID()
+                else:
                     n.setCrashed()
 
 
@@ -464,8 +492,13 @@ class Units:
         PartOf=zeek.target
 
         [Service]
+        User={user}
+        Group={group}
+
         ReadWritePaths={spooldir}/manager
         WorkingDirectory={spooldir}/manager
+
+        MemoryMax={memory_max}
 
         Environment=CLUSTER_NODE=manager
         EnvironmentFile={env_file_common}
@@ -489,8 +522,13 @@ class Units:
         PartOf=zeek.target
 
         [Service]
+        User={user}
+        Group={group}
+
         ReadWritePaths={spooldir}/logger-%i
         WorkingDirectory={spooldir}/logger-%i
+
+        MemoryMax={memory_max}
 
         Environment=PATH={path}
         Environment=CLUSTER_NODE=logger-%i
@@ -515,8 +553,13 @@ class Units:
         PartOf=zeek.target
 
         [Service]
+        User={user}
+        Group={group}
+
         ReadWritePaths={spooldir}/proxy-%i
         WorkingDirectory={spooldir}/proxy-%i
+
+        MemoryMax={memory_max}
 
         Environment=CLUSTER_NODE=proxy-%i
         EnvironmentFile={env_file_common}
@@ -541,7 +584,9 @@ class Units:
         After=zeek-manager.service zeek-logger@.service zeek-proxy@.service
 
         [Service]
-        # Allow reading form a network interface
+        User={user}
+        Group={group}
+
         CapabilityBoundingSet=CAP_NET_RAW
         AmbientCapabilities=CAP_NET_RAW
 
