@@ -1,8 +1,8 @@
-import logging
-import pathlib
 import subprocess
-import typing
 import textwrap
+import pathlib
+import logging
+import typing
 import pwd
 import grp
 import os
@@ -122,14 +122,18 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         if os.getuid() != 0:
             self.message(f"{self.prefix()}: not running as root will not work")
 
-        self.spooldir = pathlib.Path(self.getGlobalOption("spooldir")) / self.prefix()
-        self.spooldir.mkdir(parents=True, exist_ok=True)
+        self.spool_dir = pathlib.Path(self.getGlobalOption("spooldir"))
+        self.spool_dir.mkdir(parents=True, exist_ok=True)
         self.lib_unit_path = pathlib.Path(self.getOption("lib_unit_path"))
         self.zeek_bin = pathlib.Path(self.getGlobalOption("bindir")) / "zeek"
         self.bin_dir = pathlib.Path(self.getGlobalOption("bindir"))
-        self.script_dir = pathlib.Path(self.getGlobalOption("scriptsdir"))
-        self.env_file_common = self.spooldir / "environment"
-        self.env_file_d = self.spooldir / "environment.d"
+        self.scripts_dir = pathlib.Path(self.getGlobalOption("scriptsdir"))
+        self.env_file_common = self.spool_dir / "environment"
+
+        self.env_file_d = (
+            pathlib.Path(self.getGlobalOption("sitepolicypath")) / "environment.d"
+        )
+        self.env_file_d.mkdir(parents=True, exist_ok=True)
 
         # This is pretty annoything, but we cannot just extend PATH
         # within units wihout resorting to bash, so hard-code a
@@ -137,7 +141,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         # entry in the respective unit files.
         self.default_path = self.getOption("default_path")
         self.path = ":".join(
-            [str(self.bin_dir), str(self.script_dir), self.default_path]
+            [str(self.bin_dir), str(self.scripts_dir), self.default_path]
         )
 
         # Filenames for unit files.
@@ -182,6 +186,14 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             ("enabled", "bool", False, "Set to enable plugin"),
             ("user", "string", "zeek", "The user to run Zeek under"),
             ("group", "string", "zeek", "The group to run Zeek under"),
+            ("restart", "string", "on-failure", "They Restart= value to use"),
+            ("restart_sec", "string", "1", "The RestartSec= value to use"),
+            (
+                "start_limit_interval_sec",
+                "string",
+                "0",
+                "The StartLimitIntervalSec= value to use",
+            ),
             (
                 "default_path",
                 "string",
@@ -223,12 +235,6 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             ),
         ]
 
-    def cmd_install_pre(self):
-        """
-        Pre-install hook.
-        """
-        return True
-
     def cmd_install_post(self):
         """
         Implement post installation steps to put unit files in place.
@@ -242,7 +248,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             interface = worker_interfaces.pop()
         else:
             # This can be implemented by placing per-worker environment files
-            # into spooldir/systemd/envirionment.d/worker-1-1 to override the
+            # into spool_dir/systemd/envirionment.d/worker-1-1 to override the
             # INTERFACE environment variable, but for AF_PACKET we don't need
             # this for now, so skip it.
             #
@@ -272,11 +278,14 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         format_kwargs = {
             "user": self.getOption("user"),
             "group": self.getOption("group"),
-            "spooldir": self.getGlobalOption("spooldir"),
+            "spool_dir": self.spool_dir,
             "env_file_common": self.env_file_common,
             "env_file_d": self.env_file_d,
             "path": self.path,
             "zeek_bin": self.zeek_bin,
+            "restart": self.getOption("restart"),
+            "restart_sec": self.getOption("restart_sec"),
+            "start_limit_interval_sec": self.getOption("start_limit_interval_sec"),
         }
 
         with self.zeek_target.open("w") as f:
@@ -491,12 +500,14 @@ class Units:
         Description=Zeek Manager
         PartOf=zeek.target
 
+        StartLimitIntervalSec={start_limit_interval_sec}
+
         [Service]
         User={user}
         Group={group}
 
-        ReadWritePaths={spooldir}/manager
-        WorkingDirectory={spooldir}/manager
+        ReadWritePaths={spool_dir}/manager
+        WorkingDirectory={spool_dir}/manager
 
         MemoryMax={memory_max}
 
@@ -510,6 +521,9 @@ class Units:
 
         Slice=zeek-manager.slice
 
+        Restart={restart}
+        RestartSec={restart_sec}
+
         [Install]
         WantedBy=zeek.target
         """
@@ -521,12 +535,14 @@ class Units:
         Description=Zeek Logger %i
         PartOf=zeek.target
 
+        StartLimitIntervalSec={start_limit_interval_sec}
+
         [Service]
         User={user}
         Group={group}
 
-        ReadWritePaths={spooldir}/logger-%i
-        WorkingDirectory={spooldir}/logger-%i
+        ReadWritePaths={spool_dir}/logger-%i
+        WorkingDirectory={spool_dir}/logger-%i
 
         MemoryMax={memory_max}
 
@@ -538,8 +554,12 @@ class Units:
         Environment=PATH={path}
         ExecStartPre=sh -c 'date +%%s > .startup'
         ExecStart={zeek_bin} {zeek_args}
+        ExecStopPost=
 
         Slice=zeek-loggers.slice
+
+        Restart={restart}
+        RestartSec={restart_sec}
 
         [Install]
         WantedBy=zeek.target
@@ -552,12 +572,14 @@ class Units:
         Description=Zeek Proxy %i
         PartOf=zeek.target
 
+        StartLimitIntervalSec={start_limit_interval_sec}
+
         [Service]
         User={user}
         Group={group}
 
-        ReadWritePaths={spooldir}/proxy-%i
-        WorkingDirectory={spooldir}/proxy-%i
+        ReadWritePaths={spool_dir}/proxy-%i
+        WorkingDirectory={spool_dir}/proxy-%i
 
         MemoryMax={memory_max}
 
@@ -571,6 +593,9 @@ class Units:
 
         Slice=zeek-proxies.slice
 
+        Restart={restart}
+        RestartSec={restart_sec}
+
         [Install]
         WantedBy=zeek.target
         """
@@ -583,6 +608,8 @@ class Units:
         PartOf=zeek.target
         After=zeek-manager.service zeek-logger@.service zeek-proxy@.service
 
+        StartLimitIntervalSec={start_limit_interval_sec}
+
         [Service]
         User={user}
         Group={group}
@@ -592,8 +619,8 @@ class Units:
 
         MemoryMax={memory_max}
 
-        WorkingDirectory={spooldir}/worker-%i
-        ReadWritePaths={spooldir}/worker-%i
+        WorkingDirectory={spool_dir}/worker-%i
+        ReadWritePaths={spool_dir}/worker-%i
 
         EnvironmentFile={env_file_common}
         Environment=CLUSTER_NODE=worker-%i
@@ -605,6 +632,9 @@ class Units:
         ExecStart={zeek_bin} -i ${{INTERFACE}} {zeek_args}
 
         Slice=zeek-workers.slice
+
+        Restart={restart}
+        RestartSec={restart_sec}
 
         [Install]
         WantedBy=zeek.target
