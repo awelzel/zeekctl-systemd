@@ -212,7 +212,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             ("enabled", "bool", False, "Set to enable plugin"),
             ("user", "string", "zeek", "The user to run Zeek under"),
             ("group", "string", "zeek", "The group to run Zeek under"),
-            ("restart", "string", "on-failure", "They Restart= value to use"),
+            ("restart", "string", "always", "They Restart= value to use"),
             ("restart_sec", "string", "1", "The RestartSec= value to use"),
             (
                 "start_limit_interval_sec",
@@ -403,14 +403,16 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         )
 
         # Now that the common units are in place, add override
-        # directories into etc_unit_path / <unit>.d / zeekctl-override.conf
+        # directories into etc_unit_path / <unit>.d / 99-zeekctl-override.conf
         #
         # This is used for a worker's interface and also the CPU pinning,
         # or if nodes have individual environment variables.
         for node in config.Config.nodes():
             unit_id = self.node_to_unit_id(node)
 
-            override_p = self.etc_unit_path / f"{unit_id}.d" / "zeekctl-override.conf"
+            override_p = (
+                self.etc_unit_path / f"{unit_id}.d" / "99-zeekctl-override.conf"
+            )
             override_p.parent.mkdir(parents=True, exist_ok=True)
 
             props = []
@@ -710,7 +712,7 @@ class Units:
         ReadWritePaths={spool_dir}/worker-%i
 
         Environment=CLUSTER_NODE=worker-%i
-        # INTERFACE is overridden in {etc_unit_path}/zeek-worker-<instance>.d/zeekctl-override.conf
+        # INTERFACE is overridden in {etc_unit_path}/zeek-worker-<instance>.d/99-zeekctl-override.conf
         Environment=INTERFACE=
 
         Environment=PATH={path}

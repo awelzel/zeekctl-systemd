@@ -1,56 +1,93 @@
 zeekctl-systemd
 ===============
 
-A [Zeekctl](https://github.com/zeek/zeekctl) plugin that hooks the install, start
-and stop commands to use [systemd](https://systemd.io/) for process management
-instead of starting Zeek processes using ``nohup`` and shell scripts.
+This is a [Zeekctl](https://github.com/zeek/zeekctl) plugin that hooks Zeekctl's
+``install`` command in order to place [systemd](https://systemd.io/) on the
+system on which ``zeekctl`` executes. It further hooks ``start`` and ``stop``
+commands to divert execution to the appropriate ``systemctl`` commands.
 
-Single-node Zeek cluster only at this point.
+This is WIP. Feedback is welcome. Essentially, this plugin supports you in
+running Zeek processes to form a Zeek cluster directly using systemd for
+process supervision on a single system. Multi-node Zeek clusters are out scope.
+
+Quickstart
+----------
+
+    # Install this package
+    $ zkg install https://github.com/awelzel/zeekctl-systemd
+
+    # Modify zeekctl.cfg and add the following entry:
+    systemd.enabled = 1
+
+    # Ensure a zeek user and group exists and Zeek's spool/ and
+    # logs/ directory is owned by that user.
+
+    # Install the Zeek cluster to the *local* system
+    $ /opt/zeek/bin/zeekctl install
+
+    # Check the created systemd unit files:
+    $ ls -lha /usr/lib/systemd/system/zeek-*
+    $ ls -lha /etc/systemd/system/zeek.target.wants/
+    $ ls -lha /etc/systemd/system/zeek-*@*.d/*
+
+    # Start the Zeek cluster (zeekctl start) would work too.
+    $ systemctl start zeek.target
+
+    # Stop the Zeek cluster
+    $ systemctl start zeek.target
+
+    # Restart individual Zeek processes
+    $ systemctl restart zeek-logger@1 zeek-proxy@1 zeek-worker@4
+
+    # Check on all of the cluster's processes
+    $ systemd-cgtop zeek.slice
+
+
+Implementation
+--------------
+
+Renders unit files into ``/usr/lib/systemd/system`` for the individual
+Zeek process types using parameterized units. Additionally, slices for logger,
+proxy and worker processes are created.
+
+The per-process configuration is done through override files in ``/etc/systemd/systemd/``.
+For example, ``zeek-worker@1.service.d/99-zeekctl-override.conf`` has the following content:
+
+    [Service]
+    CPUAffinity=0
+    Environment=INTERFACE=af_packet::enp7s0
+
+The whole
+
 
 Limitations
 -----------
 
 Currently assumes ``node.cfg`` only contains worker, proxy and logger sections
 that use ``host=localhost``. If you need multi-node support, that's probably
-doable with Zeekctl's existing rsync infrastructure, but this isn't yet
-supporting that.
+doable with Zeekctl's existing rsync infrastructure, but it's unclear if that
+is a feature that this plugin should ever support.
 
 This plugin by default requires a ``zeek`` user in a ``zeek`` group and
 expects the ``spool/`` and ``logs/`` directories to be owned by ``zeek:zeek``.
-However, ``zeekctl install`` needs to run as ``root``.
+Note that ``zeekctl install`` needs to run as ``root`` for interaction with
+systemd, however.
 
 The post-terminate script only runs for logger processes, meaning crash
-reports are likely not fully functional.
+reports are not functional. Look into using ``coredumpctl``, it's likely
+better integrated with your distribution.
 
-Quickstart
+Overriding
 ----------
 
-    $ zkg install https://github.com/awelzel/zeekctl-systemd
+Users can place override units into the per process directories ``/etc/systemd/system/``,
+or use ``systemctl edit`` directly to place a ``override.conf`` file if per process
+specific changes are to be made.
 
-    # Add systemd.enabled = True into zeekctl.cfg
-    # Modify node.cfg as shown below.
+    $ systemctl edit zeek-manager
 
-    $ /opt/zeek/bin/zeekctl install
+    $ systemctl edit zeek-worker@1
 
-    # Check the created systemd unit files:
-    $ ls -lha /usr/lib/systemd/system/zeek-*
-    $ ls -lha /etc/systemd/system/zeek.target.wants/
-
-    # Start all Zeek processes
-    $ systemctl start zeek.target
-
-
-    # Use systemd-cgtop to check on the processes
-    $ systemd-cgtop zeek.slice
-
-    # Check available plugin options with zeekctl config:
-    s zeekctl config | grep ^systemd\.
-
-
-TODO
-----
-
-* CPU pinning
 
 
 node.cfg Example
