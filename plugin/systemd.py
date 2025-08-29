@@ -11,14 +11,14 @@ import ZeekControl.cmdresult
 import ZeekControl.config as config
 import ZeekControl.plugin
 
+logger = logging.getLogger("zeekctl.systemd")
+# logger.addHandler(logging.StreamHandler())
+
 
 class Systemd:
     """
-    Minmal class for interacting with systemd.
+    Minmal class for interacting with systemd through systemctl.
     """
-
-    logger = logging.getLogger("zeekctl.systemd")
-    # logger.addHandler(logging.StreamHandler())
 
     def __init__(self, plugin):
         self.plugin = plugin
@@ -36,11 +36,11 @@ class Systemd:
             "MainPID",
         }
 
-    def systemctl(self, args):
+    def systemctl(self, args, *, env=None, **kwargs):
         real_args = [self.bin, *self.options, *args]
-        self.logger.debug("%s", " ".join(real_args))
+        logger.debug("%s (env=%s)", " ".join(real_args), env)
         try:
-            return subprocess.check_output(real_args)
+            return subprocess.check_output(real_args, env=env, **kwargs)
         except subprocess.CalledProcessError as e:
             self.plugin.error(f"error starting: {e!r}")
             return None
@@ -105,6 +105,13 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         super().__init__(apiversion=1)
         self.sd = Systemd(self)
 
+        self.expected_slices = {
+            "zeek.slice",
+            "zeek-workers.slice",
+            "zeek-loggers.slice",
+            "zeek-proxies.slice",
+        }
+
     def name(self):
         return "zeekctl-systemd"
 
@@ -120,21 +127,19 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             return False
 
         if os.getuid() != 0:
-            self.message(f"{self.prefix()}: not running as root will not work")
+            self.error(
+                f"{self.prefix()}: not running as root - will not work right now - sorry"
+            )
+            return False
 
         self.spool_dir = pathlib.Path(self.getGlobalOption("spooldir"))
         self.spool_dir.mkdir(parents=True, exist_ok=True)
         self.lib_unit_path = pathlib.Path(self.getOption("lib_unit_path"))
+        self.etc_unit_path = pathlib.Path(self.getOption("etc_unit_path"))
         self.zeek_bin = pathlib.Path(self.getGlobalOption("bindir")) / "zeek"
         self.bin_dir = pathlib.Path(self.getGlobalOption("bindir"))
         self.scripts_dir = pathlib.Path(self.getGlobalOption("scriptsdir"))
         self.zeek_base_dir = pathlib.Path(self.getGlobalOption("zeekbase"))
-        self.env_file_common = self.spool_dir / "environment"
-
-        self.env_file_d = (
-            pathlib.Path(self.getGlobalOption("sitepolicypath")) / "environment.d"
-        )
-        self.env_file_d.mkdir(parents=True, exist_ok=True)
 
         # This is pretty annoything, but we cannot just extend PATH
         # within units wihout resorting to bash, so hard-code a
@@ -145,12 +150,13 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             [str(self.bin_dir), str(self.scripts_dir), self.default_path]
         )
 
-        # Filenames for unit files.
+        # Paths to unit files in /usr/lib/systemd/system
         self.zeek_target = self.lib_unit_path / "zeek.target"
-        self.manager_unit = self.lib_unit_path / "zeek-manager.service"
-        self.logger_unit = self.lib_unit_path / "zeek-logger@.service"
-        self.proxy_unit = self.lib_unit_path / "zeek-proxy@.service"
-        self.worker_unit = self.lib_unit_path / "zeek-worker@.service"
+        self.zeek_slice = self.lib_unit_path / "zeek.slice"
+        self.manager_service = self.lib_unit_path / "zeek-manager.service"
+        self.logger_service = self.lib_unit_path / "zeek-logger@.service"
+        self.proxy_service = self.lib_unit_path / "zeek-proxy@.service"
+        self.worker_service = self.lib_unit_path / "zeek-worker@.service"
         self.loggers_slice = self.lib_unit_path / "zeek-loggers.slice"
         self.proxies_slice = self.lib_unit_path / "zeek-proxies.slice"
         self.workers_slice = self.lib_unit_path / "zeek-workers.slice"
@@ -182,6 +188,25 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         instance = node.name.split("-", 1)[-1]
         return f"zeek-{node.type}@{instance}.service"
 
+    def replace_if_different(self, p: pathlib.Path, content: str) -> bool:
+        """
+        Only replace p if content is different, return whether the file was replaced.
+        """
+        try:
+            with p.open("r") as f:
+                old_content = f.read()
+                if old_content == content:
+                    logger.debug("file %s is up-to-date", p)
+                    return False  # early-exit
+        except FileNotFoundError:
+            pass
+
+        logger.debug("Replacing %s", p)
+        with p.open("w") as f:
+            f.write(content)
+
+        return True
+
     def options(self):
         return [
             ("enabled", "bool", False, "Set to enable plugin"),
@@ -208,14 +233,30 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
                 "Directory for base and template systemd unit files.",
             ),
             (
+                "etc_unit_path",
+                "string",
+                "/etc/systemd/system",
+                "Directory for service override .d directories.",
+            ),
+            (
+                "memory_max",
+                "string",
+                "",
+                "Maximum memory allowed for the top-level zeek slice.",
+            ),
+            (
                 "manager_memory_max",
                 "string",
                 "",
                 "Maximum memory allowed for the manager.",
             ),
+            ("manager_nice", "int", -19, "The default nice value to use for a manager"),
             ("logger_memory_max", "string", "", "Maximum memory allowed per logger."),
+            ("logger_nice", "int", -19, "The default nice value to use for a logger"),
             ("proxy_memory_max", "string", "", "Maximum memory allowed per proxy."),
+            ("proxy_nice", "int", -19, "The default nice value to use for a proxy"),
             ("worker_memory_max", "string", "", "Maximum memory allowed per worker."),
+            ("worker_nice", "int", -19, "The default nice value to use for a worker"),
             (
                 "workers_memory_max",
                 "string",
@@ -243,22 +284,6 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         After installing all scripts, render the systemd files, enable
         slices and unit instances. And disable those that aren't needed.
         """
-        interface = None
-        worker_interfaces = set([n.interface for n in config.Config.nodes("workers")])
-        if len(worker_interfaces) == 1:
-            interface = worker_interfaces.pop()
-        else:
-            # This can be implemented by placing per-worker environment files
-            # into spool_dir/systemd/envirionment.d/worker-1-1 to override the
-            # INTERFACE environment variable, but for AF_PACKET we don't need
-            # this for now, so skip it.
-            #
-            # for wn in config.Config.nodes("workers"):
-            #     print("wn", wn, dir(wn), wn.host, wn.name, wn.interface)
-            #
-            self.message("Warning: No support for per-worker interfaces at this point.")
-            interface = "per-worker-interfaces-not-implemented"
-
         policydir_auto = self.getGlobalOption("policydirsiteinstallauto")
         policydir = pathlib.Path(self.getGlobalOption("policydir"))
         policydir_policy = policydir / "policy"
@@ -285,8 +310,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             "user": self.getOption("user"),
             "group": self.getOption("group"),
             "spool_dir": self.spool_dir,
-            "env_file_common": self.env_file_common,
-            "env_file_d": self.env_file_d,
+            "etc_unit_path": self.etc_unit_path,
             "path": self.path,
             "zeek_bin": self.zeek_bin,
             "zeek_args": " ".join(zeek_args),
@@ -295,73 +319,129 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
             "start_limit_interval_sec": self.getOption("start_limit_interval_sec"),
             "scripts_dir": self.scripts_dir,
             "zeek_base_dir": self.zeek_base_dir,
+            "zeekpath": zeekpath,
         }
 
-        with self.zeek_target.open("w") as f:
-            f.write(Units.zeek_target)
+        # top-level zeek target
+        sd_reload_needed = False
+        sd_reload_needed |= self.replace_if_different(
+            self.zeek_target, Units.zeek_target
+        )
 
-        with self.loggers_slice.open("w") as f:
-            content = Units.loggers_slice.format(
-                memory_max=self.getOption("loggers_memory_max"),
-            )
-            f.write(content)
+        # top-level zeek slice
+        zeek_slice_content = Units.zeek_slice.format(
+            memory_max=self.getOption("memory_max"),
+        )
+        sd_reload_needed |= self.replace_if_different(
+            self.zeek_slice, zeek_slice_content
+        )
 
-        with self.proxies_slice.open("w") as f:
-            content = Units.proxies_slice.format(
-                memory_max=self.getOption("proxies_memory_max"),
-            )
-            f.write(content)
+        # loggers slice
+        loggers_slice_content = Units.loggers_slice.format(
+            memory_max=self.getOption("loggers_memory_max"),
+        )
+        sd_reload_needed |= self.replace_if_different(
+            self.loggers_slice, loggers_slice_content
+        )
 
-        with self.workers_slice.open("w") as f:
-            content = Units.workers_slice.format(
-                memory_max=self.getOption("workers_memory_max"),
-            )
-            f.write(content)
+        # proxies slice
+        proxies_slice_content = Units.proxies_slice.format(
+            memory_max=self.getOption("proxies_memory_max"),
+        )
+        sd_reload_needed |= self.replace_if_different(
+            self.proxies_slice, proxies_slice_content
+        )
 
-        with self.env_file_common.open("w") as f:
-            f.write("# This file is auto-generated - do not modify\n")
-            f.write(f"ZEEKPATH={zeekpath}\n")
+        # workers slice
+        workers_slice_content = Units.workers_slice.format(
+            memory_max=self.getOption("workers_memory_max"),
+        )
+        sd_reload_needed |= self.replace_if_different(
+            self.workers_slice, workers_slice_content
+        )
 
-        with self.manager_unit.open("w") as f:
-            content = Units.manager_unit.format(
-                type="manager",
-                memory_max=self.getOption("manager_memory_max"),
-                **format_kwargs,
-            )
-            f.write(content)
+        # manager unit
+        manager_content = Units.manager_unit.format(
+            type="manager",
+            memory_max=self.getOption("manager_memory_max"),
+            nice=self.getOption("manager_nice"),
+            **format_kwargs,
+        )
+        sd_reload_needed |= self.replace_if_different(
+            self.manager_service, manager_content
+        )
 
-        with self.logger_unit.open("w") as f:
-            content = Units.logger_unit_instance.format(
-                type="logger",
-                memory_max=self.getOption("logger_memory_max"),
-                **format_kwargs,
-            )
-            f.write(content)
+        # logger unit
+        logger_content = Units.logger_unit_instance.format(
+            type="logger",
+            memory_max=self.getOption("logger_memory_max"),
+            nice=self.getOption("logger_nice"),
+            **format_kwargs,
+        )
+        sd_reload_needed |= self.replace_if_different(
+            self.logger_service, logger_content
+        )
 
-        with self.proxy_unit.open("w") as f:
-            content = Units.proxy_unit_instance.format(
-                type="proxy",
-                memory_max=self.getOption("proxy_memory_max"),
-                **format_kwargs,
-            )
-            f.write(content)
+        # proxy unit
+        proxy_content = Units.proxy_unit_instance.format(
+            type="proxy",
+            memory_max=self.getOption("proxy_memory_max"),
+            nice=self.getOption("proxy_nice"),
+            **format_kwargs,
+        )
+        sd_reload_needed |= self.replace_if_different(self.proxy_service, proxy_content)
 
-        with self.worker_unit.open("w") as f:
-            content = Units.worker_unit_instance.format(
-                type="worker",
-                interface=interface,
-                memory_max=self.getOption("worker_memory_max"),
-                **format_kwargs,
-            )
-            f.write(content)
+        # worker unit
+        worker_content = Units.worker_unit_instance.format(
+            type="worker",
+            memory_max=self.getOption("worker_memory_max"),
+            nice=self.getOption("worker_nice"),
+            **format_kwargs,
+        )
+        sd_reload_needed |= self.replace_if_different(
+            self.worker_service, worker_content
+        )
 
-        # XXX: We do not really need to do this if the files above haven't changed.
-        self.sd.daemon_reload()
-
-        expected_units = set()
-
+        # Now that the common units are in place, add override
+        # directories into etc_unit_path / <unit>.d / zeekctl-override.conf
+        #
+        # This is used for a worker's interface and also the CPU pinning,
+        # or if nodes have individual environment variables.
         for node in config.Config.nodes():
-            expected_units.add(self.node_to_unit_id(node))
+            unit_id = self.node_to_unit_id(node)
+
+            override_p = self.etc_unit_path / f"{unit_id}.d" / "zeekctl-override.conf"
+            override_p.parent.mkdir(parents=True, exist_ok=True)
+
+            props = []
+            if node.pin_cpus is not None and node.pin_cpus != "":
+                props += [("CPUAffinity", int(node.pin_cpus))]
+
+            if node.interface is not None and node.interface != "":
+                props += [("Environment", f"INTERFACE={node.interface}")]
+
+            for k, v in node.env_vars.items():
+                props += [("Environment", f"{k}={v}")]
+
+            service_content = "\n".join([f"{k}={v}" for (k, v) in props])
+
+            content = textwrap.dedent(
+                """\
+            [Service]
+            {service_content}
+            """
+            ).format(service_content=service_content)
+
+            sd_reload_needed |= self.replace_if_different(override_p, content)
+
+        # If any of the unit files has changed, toggle a daemon-reload.
+        if sd_reload_needed:
+            self.sd.daemon_reload()
+
+        # All the units that we expect to be enabled on the system.
+        expected_units = {self.node_to_unit_id(n) for n in config.Config.nodes()}
+        logger.debug("expected systemd units: %s", sorted(expected_units))
+        logger.debug("expected systemd slices: %s", sorted(self.expected_slices))
 
         # Check for all units that are enabled right now and
         # disable those that we do not expect to be around
@@ -372,25 +452,20 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         )
         for enabled_unit in enabled_unit_ids:
             if enabled_unit not in expected_units:
+                logger.debug("disabling unexpected unit %s", enabled_unit)
                 self.sd.disable(enabled_unit, now=True)
 
-        # Ensure the expected slices are enabled.
-        expected_slices = {
-            "zeek-workers.slice",
-            "zeek-loggers.slice",
-            "zeek-proxies.slice",
-        }
+        enabled_slices = set()
+        for sl in self.sd.show(["zeek*.slice"]):
+            if sl["UnitFileState"] == "enabled":
+                enabled_slices.add(sl["Id"])
 
-        live_slices = set()
-        for live_slice in self.sd.show(["zeek-*.slice"]):
-            if live_slice["UnitFileState"] == "enabled":
-                live_slices.add(live_slice["Id"])
+        for expected_sl in self.expected_slices:
+            if expected_sl not in enabled_slices:
+                self.sd.enable(expected_sl, now=True)
 
-        for expected_slice in expected_slices:
-            if expected_slice not in live_slices:
-                self.sd.enable(expected_slice, now=True)
-
-        # Enable all units that aren't already enabled.
+        # Enable all units that aren't already enabled. This
+        # doesn't yet start them, but makes them available.
         for expected_unit in sorted(expected_units):
             if expected_unit not in enabled_unit_ids:
                 self.sd.enable(expected_unit)
@@ -515,15 +590,16 @@ class Units:
 
         MemoryMax={memory_max}
 
+        Nice={nice}
+
         Environment=CLUSTER_NODE=manager
-        EnvironmentFile={env_file_common}
-        EnvironmentFile=-{env_file_d}/manager
 
         Environment=PATH={path}
+        Environment=ZEEKPATH={zeekpath}
         ExecStartPre=sh -c 'date +%%s > .startup'
         ExecStart={zeek_bin} {zeek_args}
 
-        Slice=zeek-manager.slice
+        Slice=zeek.slice
 
         Restart={restart}
         RestartSec={restart_sec}
@@ -552,12 +628,12 @@ class Units:
 
         MemoryMax={memory_max}
 
-        Environment=PATH={path}
+        Nice={nice}
+
         Environment=CLUSTER_NODE=logger-%i
-        EnvironmentFile={env_file_common}
-        EnvironmentFile=-{env_file_d}/logger-%i
 
         Environment=PATH={path}
+        Environment=ZEEKPATH={zeekpath}
         ExecStartPre=sh -c 'date +%%s > .startup'
         ExecStart={zeek_bin} {zeek_args}
 
@@ -591,11 +667,12 @@ class Units:
 
         MemoryMax={memory_max}
 
+        Nice={nice}
+
         Environment=CLUSTER_NODE=proxy-%i
-        EnvironmentFile={env_file_common}
-        EnvironmentFile=-{env_file_d}/proxy-%i
 
         Environment=PATH={path}
+        Environment=ZEEKPATH={zeekpath}
         ExecStartPre=sh -c 'date +%%s > .startup'
         ExecStart={zeek_bin} {zeek_args}
 
@@ -627,15 +704,17 @@ class Units:
 
         MemoryMax={memory_max}
 
+        Nice={nice}
+
         WorkingDirectory={spool_dir}/worker-%i
         ReadWritePaths={spool_dir}/worker-%i
 
-        EnvironmentFile={env_file_common}
         Environment=CLUSTER_NODE=worker-%i
-        Environment=INTERFACE={interface}
-        EnvironmentFile=-{env_file_d}/worker-%i
+        # INTERFACE is overridden in {etc_unit_path}/zeek-worker-<instance>.d/zeekctl-override.conf
+        Environment=INTERFACE=
 
         Environment=PATH={path}
+        Environment=ZEEKPATH={zeekpath}
         ExecStartPre=sh -c 'date +%%s > .startup'
         ExecStart={zeek_bin} -i ${{INTERFACE}} {zeek_args}
 
@@ -643,6 +722,19 @@ class Units:
 
         Restart={restart}
         RestartSec={restart_sec}
+
+        [Install]
+        WantedBy=zeek.target
+        """
+    )
+
+    zeek_slice = textwrap.dedent(
+        """\
+        [Unit]
+        PartOf=zeek.target
+
+        [Slice]
+        MemoryMax={memory_max}
 
         [Install]
         WantedBy=zeek.target
@@ -658,7 +750,7 @@ class Units:
         MemoryMax={memory_max}
 
         [Install]
-        WantedBy=multi-user.target
+        WantedBy=zeek.target
         """
     )
 
@@ -671,7 +763,7 @@ class Units:
         MemoryMax={memory_max}
 
         [Install]
-        WantedBy=multi-user.target
+        WantedBy=zeek.target
         """
     )
 
@@ -684,6 +776,6 @@ class Units:
         MemoryMax={memory_max}
 
         [Install]
-        WantedBy=multi-user.target
+        WantedBy=zeek.target
         """
     )
