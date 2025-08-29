@@ -1,14 +1,16 @@
 zeekctl-systemd
 ===============
 
+Run a Zeek cluster with systemd.
+
 This is a [Zeekctl](https://github.com/zeek/zeekctl) plugin that hooks Zeekctl's
-``install`` command in order to place [systemd](https://systemd.io/) on the
-system on which ``zeekctl`` executes. It further hooks ``start`` and ``stop``
+``install`` command in order to place [systemd](https://systemd.io/) unit files
+onto the local system on which ``zeekctl`` runs. It further hooks ``start`` and ``stop``
 commands to divert execution to the appropriate ``systemctl`` commands.
 
-This is WIP. Feedback is welcome. Essentially, this plugin supports you in
-running Zeek processes to form a Zeek cluster directly using systemd for
-process supervision on a single system. Multi-node Zeek clusters are out scope.
+Essentially, this plugin supports you in running a Zeek cluster supervised by
+systemd instead of Zeekctl's custom process management. Multi-node Zeek clusters
+are out scope.
 
 Quickstart
 ----------
@@ -22,7 +24,7 @@ Quickstart
     # Ensure a zeek user and group exists and Zeek's spool/ and
     # logs/ directory is owned by that user.
 
-    # Install the Zeek cluster to the *local* system
+    # Install the Zeek cluster's unit files onto the *local* system
     $ /opt/zeek/bin/zeekctl install
 
     # Check the created systemd unit files:
@@ -46,9 +48,10 @@ Quickstart
 Implementation
 --------------
 
-Renders unit files into ``/usr/lib/systemd/system`` for the individual
-Zeek process types using parameterized units. Additionally, slices for logger,
-proxy and worker processes are created.
+This is a Zeekctl plugin. It uses the post install hook to render parametrized
+unit files into ``/usr/lib/systemd/system`` for the individual Zeek process types.
+Additionally, slices for logger, proxy and worker processes are created to cap
+the total amount of memory a collection of these processes may consume.
 
 The per-process configuration is done through override files in ``/etc/systemd/systemd/``.
 For example, ``zeek-worker@1.service.d/99-zeekctl-override.conf`` has the following content:
@@ -56,8 +59,6 @@ For example, ``zeek-worker@1.service.d/99-zeekctl-override.conf`` has the follow
     [Service]
     CPUAffinity=0
     Environment=INTERFACE=af_packet::enp7s0
-
-The whole
 
 
 Limitations
@@ -123,15 +124,28 @@ nicer naming of the created systemd units.
 
 
 
-Per Node Environment Variables
-------------------------------
+Available Plugin Options
+------------------------
 
-In ``share/zeek/site/environment.d/``, place files named like the node,
-e.g. ``logger-1`` or ``worker-1``. This can be used to override the environment
-variables of the systemd unit files:
-
-    # worker-1
-    INTERFACE=eth0
-
-    # worker-2
-    INTERFACE=eth1
+    $ zeekctl config | grep '^systemd\.'
+    systemd.default_path = /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    systemd.enabled = True
+    systemd.etc_unit_path = /etc/systemd/system
+    systemd.group = zeek
+    systemd.lib_unit_path = /usr/lib/systemd/system
+    systemd.logger_memory_max =
+    systemd.logger_nice = -19
+    systemd.loggers_memory_max =
+    systemd.manager_memory_max =
+    systemd.manager_nice = -19
+    systemd.memory_max =
+    systemd.proxies_memory_max =
+    systemd.proxy_memory_max =
+    systemd.proxy_nice = -19
+    systemd.restart = always
+    systemd.restart_sec = 1
+    systemd.start_limit_interval_sec = 0
+    systemd.user = zeek
+    systemd.worker_memory_max =
+    systemd.worker_nice = -19
+    systemd.workers_memory_max =
