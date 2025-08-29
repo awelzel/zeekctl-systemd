@@ -89,6 +89,23 @@ specific changes are to be made.
 
     $ systemctl edit zeek-worker@1
 
+Testing in a Container
+----------------------
+
+The included [Dockerfile](./docker/Dockerfile) shows how to create a container
+image that includes a bare-bones systemd installation and configures a Zeek cluster
+with four workers within this container, listening on ``eth0``. Note that this
+starts a privileged container!
+
+    # Create the container image
+    $ make container
+
+    # Start the container in the backgroun
+    $ make up
+
+    # Enter the container or just run systmectl status within the running container.
+    $ make enter
+    $ make status
 
 
 node.cfg Example
