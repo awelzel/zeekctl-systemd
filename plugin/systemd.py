@@ -36,13 +36,27 @@ class Systemd:
             "MainPID",
         }
 
+        self.systemd_is_running = None
+
+    def is_running(self):
+        if self.systemd_is_running is None:
+            try:
+                subprocess.check_output([self.bin, "status"])
+                self.systemd_is_running = True
+            except subprocess.CalledProcessError:
+                self.systemd_is_running = False
+
+        return self.systemd_is_running
+
     def systemctl(self, args, *, env=None, **kwargs):
         real_args = [self.bin, *self.options, *args]
         logger.debug("%s (env=%s)", " ".join(real_args), env)
         try:
-            return subprocess.check_output(real_args, env=env, **kwargs)
+            return subprocess.check_output(real_args, env=env, **kwargs).decode("utf-8")
         except subprocess.CalledProcessError as e:
-            self.plugin.error(f"error starting: {e!r}")
+            if self.is_running():
+                self.plugin.error(f"error starting: {e!r}")
+
             return None
 
     def enable(self, name, *, now=False):
@@ -79,7 +93,11 @@ class Systemd:
 
         real_args += args
 
-        output = self.systemctl(real_args).decode("utf-8")
+        # If systemd is not running, do not do anything.
+        output = self.systemctl(real_args)
+        if output is None:
+            return []
+
         result = []
         current = {}
         for line in output.splitlines():
@@ -455,7 +473,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         for enabled_unit in enabled_unit_ids:
             if enabled_unit not in expected_units:
                 logger.debug("disabling unexpected unit %s", enabled_unit)
-                self.sd.disable(enabled_unit, now=True)
+                self.sd.disable(enabled_unit, now=self.sd.is_running())
 
         enabled_slices = set()
         for sl in self.sd.show(["zeek*.slice"]):
@@ -464,7 +482,7 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
 
         for expected_sl in self.expected_slices:
             if expected_sl not in enabled_slices:
-                self.sd.enable(expected_sl, now=True)
+                self.sd.enable(expected_sl, now=self.sd.is_running())
 
         # Enable all units that aren't already enabled. This
         # doesn't yet start them, but makes them available.
@@ -485,6 +503,9 @@ class SystemdPlugin(ZeekControl.plugin.Plugin):
         for node, success, output in self.executor.run_cmds(cmds):
             if not success:
                 self.error(f"cannot chown working directory for {node.name}")
+
+        # Enable the zeek.target
+        self.sd.enable("zeek.target")
 
     def cmd_start_pre(self, nodes):
         """
